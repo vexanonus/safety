@@ -1,0 +1,9 @@
+#!/bin/bash
+# run: safety's commands, from anywhere. run [setup|test|check PATH...]
+H=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+case "${1:-test}" in
+  setup) mkdir -p "${SAFETY_CONFIG:-$HOME/.config/safety}" && ln -sf "$H/safety" "$HOME/.local/bin/safety" \
+           && echo "safety is on your PATH. Put your private words in ${SAFETY_CONFIG:-$HOME/.config/safety}/terms.txt" ;;
+  test)  exec "$H/test" "${@:2}" ;;
+  *)     exec "$H/safety" "$@" ;;
+esac

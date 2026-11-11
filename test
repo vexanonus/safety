@@ -1,0 +1,62 @@
+#!/bin/bash
+# test: proves safety works, in a throwaway folder with made-up words. No AI unless --ai.
+set -u
+H=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+S="$H/safety"
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+export SAFETY_CONFIG="$T/conf"; mkdir -p "$SAFETY_CONFIG"
+printf 'Zebedee\n~bluebell\n~marigold\nre:\\bREF-[0-9]{4}\\b\n' > "$SAFETY_CONFIG/terms.txt"
+printf 'Zebedee Smith Park\n' > "$SAFETY_CONFIG/harmless.txt"
+pass=0; fail=0
+ok()  { if "$@" >/dev/null 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAILED: $*"; fi; }
+bad() { if "$@" >/dev/null 2>&1; then fail=$((fail+1)); echo "SHOULD HAVE FAILED: $*"; else pass=$((pass+1)); fi; }
+
+cd "$T"
+echo 'A soup recipe.' > clean.md
+echo 'Zebedee went to the shops.' > name.md
+echo 'We met at Zebedee Smith Park.' > harmless.md
+echo 'Bluebell only.' > weak1.md
+echo 'Bluebell and marigold.' > weak2.md
+echo '<p>File REF-1234</p>' > regex.html
+ok  "$S" scan clean.md
+bad "$S" scan name.md
+ok  "$S" scan harmless.md
+ok  "$S" scan weak1.md
+bad "$S" scan weak2.md
+bad "$S" scan regex.html
+
+# hidden data: a photo with GPS fails; stripped, it passes
+if command -v magick >/dev/null && command -v exiftool >/dev/null; then
+  magick -size 8x8 xc:white photo.jpg
+  exiftool -q -overwrite_original -GPSLatitude=1 -GPSLatitudeRef=N -GPSLongitude=1 -GPSLongitudeRef=E photo.jpg
+  bad "$S" scan photo.jpg
+  ok  "$S" strip photo.jpg
+  ok  "$S" scan photo.jpg
+fi
+
+# every check is logged
+ok grep -q name.md "$SAFETY_CONFIG/log.tsv"
+
+# git hook: blocks a private word in a repo that publishes; ignores a repo with no remote
+git init -q repo && cd repo && git remote add origin https://example.invalid/x.git
+echo 'Zebedee' > a.md && git add a.md
+SAFETY_CLAUDE=/usr/bin/false bad "$S" staged
+SAFETY_SKIP=1 ok "$S" staged
+git remote remove origin
+ok "$S" staged
+cd "$T"
+
+# the AI reads (costs a few cents)
+if [ "${1:-}" = "--ai" ]; then
+  echo 'A soup recipe with roast pumpkin and stock.' > soup.md
+  echo 'I told the auditor the figures were fine even though I knew they were not. John Smith of 12 Example Street is a crook and I will make him pay.' > risky.md
+  ok  "$S" check soup.md
+  bad "$S" check risky.md
+  # reveal: a repo whose history ties a handle to a real name and home address fails
+  mkdir leaky && cd leaky && git init -q && echo 'A tool.' > README.md && git add README.md \
+    && git -c user.name="Jane Q Citizen" -c user.email="jane.citizen@example.com" commit -qm "fix after my custody hearing at 12 Example St" && cd ..
+  bad "$S" reveal leaky
+fi
+
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]

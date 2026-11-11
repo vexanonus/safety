@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""safety: check a file before it goes public.
+
+Five checks per file, all automatic:
+  1. words    private names, numbers and phrases from your own list
+  2. hidden   metadata in photos, PDFs and video (GPS, author, camera, original name)
+  3. child    an AI read: is a vulnerable person identifiable next to private details?
+  4. legal    an AI read: what would a lawyer on either side quote from this?
+  5. public   an AI read: could a careful public figure quote this as a respectable view?
+And one per folder or repo:
+  reveal      an AI read as a suspicious stranger: what does the whole thing give away
+              about its author (identity, place, situation, ways of working), git history included?
+
+A file that passes is recorded by its fingerprint (sha256) in approved.tsv.
+Every check, pass or fail, is one line in log.tsv. Change the file and it is checked again.
+
+  safety check PATH...     all five checks on files or folders
+  safety reveal DIR...     what a stranger learns about you from a folder or repo (run before making it public)
+  safety scan PATH...      checks 1-2 only (fast, no AI)
+  safety staged            git pre-commit: checks staged files; AI reads only what checks 1-2 flag
+  safety strip FILE...     remove hidden metadata (exiftool -all=)
+  safety log [N]           last N log lines (default 20)
+
+Private settings live outside this repo, in $SAFETY_CONFIG (default ~/.config/safety):
+  terms.txt      one private term per line   (~term = weak, re:PATTERN = regex)
+  harmless.txt   phrases that hold a term but are someone else's (blanked first)
+  context.md     what the AI readers should know (such as approved pen names)
+  log.tsv, approved.tsv    written by this tool
+Env: SAFETY_MODEL (default opus), SAFETY_SKIP=1 (skip the git hook once).
+"""
+import hashlib, json, os, re, subprocess, sys, tempfile, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CONF = os.path.expanduser(os.environ.get("SAFETY_CONFIG") or "~/.config/safety")
+MODEL = os.environ.get("SAFETY_MODEL", "opus")
+CLAUDE = os.environ.get("SAFETY_CLAUDE") or next(
+    (p for p in [os.path.expanduser("~/.local/bin/claude")] if os.access(p, os.X_OK)), "claude")
+
+TEXT = {".md", ".txt", ".html", ".htm", ".svg", ".json", ".xml", ".csv", ".tsv", ".js", ".ts", ".tsx", ".jsx",
+        ".astro", ".vue", ".css", ".yml", ".yaml", ".toml", ".srt", ".vtt", ".rss", ".mdx", ".njk", ".liquid"}
+IMAGE = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".tif", ".tiff"}
+MEDIA = IMAGE | {".pdf", ".mp4", ".mov", ".m4v", ".mp3", ".m4a", ".wav", ".docx"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".astro", ".wrangler", ".cache"}
+# Metadata fields that can identify a person or a place.
+META_TAGS = ["GPSLatitude", "GPSLongitude", "GPSPosition", "Author", "Creator", "Artist", "OwnerName",
+             "Copyright", "By-line", "XPAuthor", "LastModifiedBy", "SerialNumber", "BodySerialNumber",
+             "LensSerialNumber", "CameraOwnerName", "Title", "Subject", "Keywords", "Description",
+             "ImageDescription", "UserComment", "Comment", "OriginalFileName", "PreservedFileName",
+             "DocumentName", "HostComputer", "Make", "Model"]
+ALWAYS_BAD = {"GPSLatitude", "GPSLongitude", "GPSPosition", "SerialNumber", "BodySerialNumber",
+              "LensSerialNumber", "CameraOwnerName", "OwnerName", "HostComputer", "OriginalFileName", "PreservedFileName"}
+
+
+def say(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def die(msg, code=2):
+    say("safety: " + msg)
+    sys.exit(code)
+
+
+# ---------- settings ----------
+def conf(name):
+    return os.path.join(CONF, name)
+
+
+def load_terms():
+    path = conf("terms.txt")
+    if not os.path.exists(path):
+        die("no word list at %s. Make it: one private term per line (names, numbers, places)." % path)
+    strong, weak = [], []
+    for line in open(path, encoding="utf-8"):
+        line = line.rstrip("\n")
+        if not line.strip() or line.startswith("#"):
+            continue
+        w = line.startswith("~")
+        if w:
+            line = line[1:]
+        if line.startswith("re:"):
+            try:
+                rx = re.compile(line[3:], re.I)
+            except re.error as e:
+                die("bad regex in %s: %s" % (path, e))
+            label = "pattern"
+        else:
+            rx = re.compile(r"(?<![A-Za-z])" + re.escape(line.strip()) + r"(?![A-Za-z])", re.I)
+            label = line.strip()
+        (weak if w else strong).append((label, rx))
+    return strong, weak
+
+
+def load_harmless():
+    out = []
+    try:
+        for line in open(conf("harmless.txt"), encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.append(re.compile(r"(?<![A-Za-z])" + r"\s+".join(map(re.escape, line.split())) + r"(?![A-Za-z])", re.I))
+    except OSError:
+        pass
+    return out
+
+
+def read_context():
+    try:
+        return open(conf("context.md"), encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+# ---------- records ----------
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def approved():
+    out = set()
+    try:
+        for line in open(conf("approved.tsv"), encoding="utf-8"):
+            if line and not line.startswith("sha256"):
+                out.add(line.split("\t", 1)[0])
+    except OSError:
+        pass
+    return out
+
+
+def append(name, header, row):
+    path = conf(name)
+    new = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as f:
+        if new:
+            f.write("\t".join(header) + "\n")
+        f.write("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in row) + "\n")
+
+
+def record(path, digest, result, detail, model="", cost=0.0):
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    append("log.tsv", ["date", "file", "sha256", "result", "detail", "model", "cost_usd"],
+           [stamp, path, digest[:16], result, detail, model, "%.4f" % cost])
+    if result == "pass":
+        append("approved.tsv", ["sha256", "date", "file", "model"], [digest, stamp, path, model or "scan"])
+
+
+# ---------- reading files ----------
+def kind(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in TEXT:
+        return "text"
+    if ext in MEDIA:
+        return "image" if ext in IMAGE else "media"
+    return None
+
+
+def as_text(path, data):
+    """Readable text of a file, or '' if it has none."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in TEXT:
+        return data.decode("utf-8", "replace")
+    if ext in (".pdf", ".docx"):
+        with tempfile.NamedTemporaryFile(suffix=ext) as t:
+            t.write(data)
+            t.flush()
+            cmd = ["pdftotext", "-q", t.name, "-"] if ext == ".pdf" else ["textutil", "-convert", "txt", "-stdout", t.name]
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=120).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+    return ""
+
+
+def plain(text):
+    """Strip markup so the readers see words, not tags."""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"[ \t]+", " ", text)
+
+
+# ---------- check 1: words ----------
+def words(text, terms, harmless):
+    strong, weak = terms
+    for h in harmless:
+        text = h.sub(" ", text)
+    s = sorted({lab for lab, rx in strong if rx.search(text)})
+    w = sorted({lab for lab, rx in weak if rx.search(text)})
+    if s or len(w) >= 2:
+        return s + w
+    return []
+
+
+# ---------- check 2: hidden data ----------
+def hidden(path, data, terms, harmless):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in MEDIA:
+        return []
+    with tempfile.NamedTemporaryFile(suffix=ext) as t:
+        t.write(data)
+        t.flush()
+        try:
+            r = subprocess.run(["exiftool", "-j", "-n"] + ["-" + k for k in META_TAGS] + [t.name],
+                               capture_output=True, text=True, timeout=60)
+            meta = (json.loads(r.stdout or "[{}]") or [{}])[0]
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return ["could not read metadata (is exiftool installed?)"]
+    found = []
+    for k, v in meta.items():
+        if k == "SourceFile" or v in ("", None):
+            continue
+        if k in ALWAYS_BAD or words(str(v), terms, harmless):
+            found.append(k)
+    return found
+
+
+# ---------- checks 3-4: the AI reads ----------
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "child": {"type": "object", "properties": {
+            "verdict": {"enum": ["pass", "fail"]},
+            "issues": {"type": "array", "items": {"type": "string"}}}, "required": ["verdict", "issues"]},
+        "legal": {"type": "object", "properties": {
+            "verdict": {"enum": ["pass", "fail"]},
+            "issues": {"type": "array", "items": {"type": "object", "properties": {
+                "quote": {"type": "string"}, "side": {"type": "string"},
+                "why": {"type": "string"}, "fix": {"type": "string"}},
+                "required": ["quote", "side", "why", "fix"]}}}, "required": ["verdict", "issues"]},
+        "public": {"type": "object", "properties": {
+            "verdict": {"enum": ["pass", "fail"]},
+            "issues": {"type": "array", "items": {"type": "object", "properties": {
+                "quote": {"type": "string"}, "why": {"type": "string"}, "fix": {"type": "string"}},
+                "required": ["quote", "why", "fix"]}}}, "required": ["verdict", "issues"]},
+    },
+    "required": ["child", "legal", "public"],
+}
+
+
+def ask_ai(prompt_file, body, schema, image_path=None):
+    """One headless Claude call returning structured JSON: (result, cost). Raises RuntimeError."""
+    prompt = open(os.path.join(HERE, "prompts", prompt_file), encoding="utf-8").read()
+    ctx = read_context()
+    if ctx:
+        body = "WHAT YOU NEED TO KNOW (private, from the publisher):\n%s\n\n%s" % (ctx, body)
+    cmd = [CLAUDE, "-p", "--model", MODEL, "--setting-sources", "", "--strict-mcp-config",
+           "--no-session-persistence", "--output-format", "json", "--json-schema", json.dumps(schema),
+           "--system-prompt", prompt, "--tools", "Read" if image_path else ""]
+    if image_path:
+        cmd += ["--allowedTools", "Read", "--add-dir", os.path.dirname(image_path)]
+    try:
+        r = subprocess.run(cmd, input=body, capture_output=True, text=True, timeout=900)
+        j = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError("AI read failed: %s" % (getattr(e, "args", [e])[0]))
+    out = j.get("structured_output")
+    if j.get("is_error") or not out:
+        raise RuntimeError("AI read failed: %s" % str(j.get("result", ""))[:200])
+    return out, float(j.get("total_cost_usd") or 0)
+
+
+def ai_read(path, text, image_path=None):
+    """Returns (reads, cost): reads holds child, legal and public."""
+    body = "FILE NAME: %s\n\n" % os.path.basename(path)
+    if image_path:
+        body += "THE PICTURE is at %s. Open it with the Read tool and look at it.\n\n" % image_path
+    if text.strip():
+        body += "THE TEXT:\n<<<\n%s\n>>>\n" % text[:150000]
+    return ask_ai("read.md", body, SCHEMA, image_path)
+
+
+# ---------- one file ----------
+def check_one(path, data, terms, harmless, ok, use_ai, ai_only_if_flagged=False):
+    """Returns (passed, lines to show)."""
+    digest = sha(data)
+    if digest in ok:
+        return True, []
+    k = kind(path)
+    if k is None:
+        return True, []
+    text = as_text(path, data)
+    hits = words(plain(text) if k == "text" else text, terms, harmless) if text else []
+    meta = hidden(path, data, terms, harmless)
+    show, failed = [], False
+    if meta:
+        failed = True
+        show.append("  hidden data: %s  ->  safety strip %s" % (", ".join(meta), path))
+    flagged = bool(hits)
+    run_ai = use_ai and (flagged or not ai_only_if_flagged) and (text.strip() or k == "image")
+    if hits and not run_ai:
+        failed = True
+        show.append("  private words: %s" % ", ".join(hits))
+    detail = ["words:" + (",".join(hits) if hits else "none"), "hidden:" + (",".join(meta) if meta else "none")]
+    cost, model = 0.0, ""
+    if run_ai:
+        # A picture is read from a throwaway copy (the staged version may not be on disk).
+        with tempfile.TemporaryDirectory(prefix="safety-") as tmp:
+            img = None
+            if k == "image":
+                img = os.path.join(tmp, "picture" + os.path.splitext(path)[1].lower())
+                open(img, "wb").write(data)
+            try:
+                reads, cost = ai_read(path, plain(text) if k == "text" else text, img)
+                child, legal, public = reads["child"], reads["legal"], reads["public"]
+                model = MODEL
+            except RuntimeError as e:
+                failed = True
+                if hits:
+                    show.append("  private words: %s" % ", ".join(hits))
+                show.append("  " + str(e))
+                detail.append("ai:error")
+                child = legal = public = None
+        if child is not None:
+            if hits:
+                show.append("  private words: %s (read by AI in context)" % ", ".join(hits))
+            if child["verdict"] == "fail":
+                failed = True
+                show += ["  child: " + i for i in child["issues"]] or ["  child: fail"]
+            if legal["verdict"] == "fail":
+                failed = True
+                for i in legal["issues"]:
+                    show.append('  legal (%s): "%s"\n      why: %s\n      fix: %s' % (i["side"], i["quote"][:200], i["why"], i["fix"]))
+            if public["verdict"] == "fail":
+                failed = True
+                for i in public["issues"]:
+                    show.append('  public: "%s"\n      why: %s\n      fix: %s' % (i["quote"][:200], i["why"], i["fix"]))
+            detail += ["child:" + child["verdict"], "legal:" + legal["verdict"], "public:" + public["verdict"]]
+    result = "fail" if failed else "pass"
+    record(path, digest, result, " ".join(detail), model, cost)
+    return not failed, show
+
+
+def walk(paths):
+    for p in paths:
+        if os.path.isdir(p):
+            for root, dirs, files in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+                for f in sorted(files):
+                    yield os.path.join(root, f)
+        elif os.path.isfile(p):
+            yield p
+        else:
+            say("safety: not found: " + p)
+
+
+def run_paths(paths, use_ai):
+    if not paths:
+        die("give a file or folder")
+    terms, harmless, ok = load_terms(), load_harmless(), approved()
+    n = bad = 0
+    for p in walk(paths):
+        if kind(p) is None:
+            continue
+        n += 1
+        passed, show = check_one(os.path.abspath(p), open(p, "rb").read(), terms, harmless, ok, use_ai)
+        if not passed:
+            bad += 1
+            print("FAIL " + p)
+            print("\n".join(show))
+    print("%d checked, %d passed, %d failed%s" % (n, n - bad, bad, "" if use_ai else " (words and hidden data only)"))
+    return 1 if bad else 0
+
+
+# ---------- git hook ----------
+def git(*a):
+    return subprocess.run(["git"] + list(a), capture_output=True)
+
+
+def staged():
+    if os.environ.get("SAFETY_SKIP") == "1":
+        return 0
+    # Only repos that publish: a repo with no remote never leaves the machine.
+    if not git("remote").stdout.strip():
+        return 0
+    if not os.path.exists(conf("terms.txt")):
+        return 0
+    terms, harmless, ok = load_terms(), load_harmless(), approved()
+    top = git("rev-parse", "--show-toplevel").stdout.decode().strip()
+    names = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z").stdout.decode().split("\0")
+    bad = []
+    for name in filter(None, names):
+        if kind(name) is None:
+            continue
+        data = git("show", ":" + name).stdout
+        passed, show = check_one(os.path.join(top, name), data, terms, harmless, ok, use_ai=True, ai_only_if_flagged=True)
+        if not passed:
+            bad.append((name, show))
+    if not bad:
+        return 0
+    say("\nsafety: commit blocked. These files would put something private online:\n")
+    for name, show in bad:
+        say("FAIL " + name)
+        say("\n".join(show))
+    say("\nFix them and commit again. A false alarm? Add the phrase to %s." % conf("harmless.txt"))
+    say("Skip once on purpose: SAFETY_SKIP=1 git commit ...\n")
+    return 1
+
+
+# ---------- reveal: what a stranger learns about you ----------
+REVEAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"enum": ["pass", "fail"]},
+        "findings": {"type": "array", "items": {"type": "object", "properties": {
+            "what": {"type": "string"}, "evidence": {"type": "string"}, "where": {"type": "string"},
+            "kind": {"enum": ["stated", "inferred"]}, "risk": {"enum": ["high", "medium", "low"]},
+            "fix": {"type": "string"}}, "required": ["what", "evidence", "where", "kind", "risk", "fix"]}},
+    },
+    "required": ["verdict", "findings"],
+}
+
+
+def git_facts(top):
+    """What git would publish besides the files: names, emails, times, remotes, messages."""
+    def g(*a):
+        return subprocess.run(["git", "-C", top] + list(a), capture_output=True, text=True).stdout
+    if not g("rev-parse", "--git-dir").strip():
+        return ""
+    out = "GIT REMOTES:\n" + g("remote", "-v")
+    out += "\nGIT HISTORY (every commit that would be published):\n"
+    out += g("log", "--all", "--format=%h author=%an <%ae> %ad committer=%cn <%ce> %cd | %s%n%b", "--date=iso")[:60000]
+    return out
+
+
+def reveal(paths):
+    """Read a folder or repo the way a suspicious stranger would; list what it gives away."""
+    if not paths:
+        die("give a folder or repo")
+    body = ""
+    for p in paths:
+        top = os.path.abspath(p)
+        if os.path.isdir(top):
+            body += git_facts(top) + "\n"
+        for f in walk([p]):
+            if kind(f) is None and os.path.splitext(f)[1]:
+                continue
+            data = open(f, "rb").read()
+            if b"\0" in data[:4096] and kind(f) != "media":
+                continue
+            text = as_text(f, data)
+            meta = hidden(f, data, ([], []), [])
+            if text.strip() or meta:
+                body += "=== FILE %s%s\n%s\n" % (os.path.relpath(f, top if os.path.isdir(top) else os.path.dirname(top)),
+                                                  "  [hidden data: %s]" % ", ".join(meta) if meta else "", text[:40000])
+        if len(body) > 400000:
+            say("safety: large folder; reading the first 400,000 characters")
+            body = body[:400000]
+            break
+    try:
+        out, cost = ask_ai("reveal.md", body, REVEAL_SCHEMA)
+    except RuntimeError as e:
+        die(str(e), 1)
+    order = {"high": 0, "medium": 1, "low": 2}
+    for i in sorted(out["findings"], key=lambda x: order[x["risk"]]):
+        print("%-6s %-8s %s\n       evidence: %s (%s)\n       fix: %s" % (i["risk"], i["kind"], i["what"], i["evidence"][:200], i["where"], i["fix"]))
+    print("%s  (%d findings, $%.2f)" % (out["verdict"].upper(), len(out["findings"]), cost))
+    for p in paths:
+        record(os.path.abspath(p), sha(body.encode()), out["verdict"], "reveal:%d findings" % len(out["findings"]), MODEL, cost)
+    return 0 if out["verdict"] == "pass" else 1
+
+
+def strip(paths):
+    if not paths:
+        die("give a file")
+    r = subprocess.run(["exiftool", "-all=", "-overwrite_original"] + paths)
+    return r.returncode
+
+
+def show_log(n):
+    try:
+        lines = open(conf("log.tsv"), encoding="utf-8").read().splitlines()
+    except OSError:
+        die("no log yet at " + conf("log.tsv"), 1)
+    print("\n".join(lines[:1] + lines[1:][-n:]))
+    return 0
+
+
+def main(argv):
+    cmd, rest = (argv[0], argv[1:]) if argv else ("help", [])
+    if cmd == "check":
+        return run_paths(rest, use_ai=True)
+    if cmd == "scan":
+        return run_paths(rest, use_ai=False)
+    if cmd == "staged":
+        return staged()
+    if cmd == "reveal":
+        return reveal(rest)
+    if cmd == "strip":
+        return strip(rest)
+    if cmd == "log":
+        return show_log(int(rest[0]) if rest else 20)
+    print(__doc__.strip())
+    return 0 if cmd in ("help", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    os.makedirs(CONF, exist_ok=True)
+    sys.exit(main(sys.argv[1:]))
